@@ -16,15 +16,20 @@ import scipy.io as sio
 from multiprocessing import Pool, cpu_count
 from sklearn.svm import SVC
 from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.pipeline import make_pipeline
+
 
 # === User settings ===
-BY_CHANNEL_DIR = "n_since_last_click_by_channel"
+BY_CHANNEL_DIR = "n_since_last_click_by_channel_filtered"
 POWER_DIR      = "/home/yuantao/Downloads/files/data_power_trials"
 THRESHOLDS     = list(range(1, 21))
 SVM_PARAMS     = {
-    'kernel': 'rbf',
+    'kernel': 'linear',
     'C': 1.0,
     'gamma': 'scale',
+    "class_weight": "balanced",
     'decision_function_shape': 'ovr',
     'random_state': 42
 }
@@ -37,7 +42,7 @@ BAND_KEYS = [
     "alpha_data",
     "beta_data",
     "lowgamma_data",
-    "highgamma_data"
+
 ]
 
 # global cache for preloaded band means
@@ -72,23 +77,38 @@ def preload_band_means(requests):
                 band_cache[(subj, chan, key)] = arr.mean(axis=1)
     print("Preloading complete.\n")
 
+
+WIN_SPLITS = 4    
+STAT_FUNCS = [np.mean, np.std]
+
 def compute_features(args):
     """
-    Worker function for parallel feature extraction.
-    args = (subj, chan, idx, nclick)
-    Returns (feature_vector, nclick)
+    args  -> (subj, chan, idx, nclick)
+    return-> (feature_vector, nclick)
     """
     subj, chan, idx, nclick = args
-    idx0 = idx - 1  # zero-based
+    idx0 = idx - 1
     feats = []
+
     for key in BAND_KEYS:
         band_means = band_cache.get((subj, chan, key))
         if band_means is None:
-            feats.append(0.0)
-        else:
-            # band_means[:, idx0] shape = (time_points,)
-            feats.append(band_means[:, idx0].mean())
+            feats.extend([0.0] * (2 * (1 + WIN_SPLITS)))
+            continue
+
+        ts = band_means[:, idx0]               
+        feats.append(ts.mean())
+        feats.append(ts.std())
+
+        segments = np.array_split(ts, WIN_SPLITS)
+        for seg in segments:
+            feats.append(seg.mean())
+            feats.append(seg.std())
+
     return feats, nclick
+
+
+SUBJ_ID = 1
 
 def main():
     # 1) Load and concat per-subject CSVs
@@ -98,6 +118,7 @@ def main():
         if fname.endswith(".csv"):
             dfs.append(pd.read_csv(os.path.join(BY_CHANNEL_DIR, fname)))
     data_df = pd.concat(dfs, ignore_index=True)
+    data_df = data_df[data_df["subject"] == SUBJ_ID]
     n_samples = len(data_df)
     print(f"Total samples: {n_samples}\n")
 
@@ -133,9 +154,20 @@ def main():
         print(f"[{i}/{total_thr}] Threshold = {thr}")
         y = np.array([label_clicks(n, thr) for n in clicks], dtype=int)
 
-        clf = SVC(**SVM_PARAMS)
+        PCA_DIM = 0.95        
+        clf = make_pipeline(
+        StandardScaler(),                         # zero-mean / unit-var
+        PCA(n_components=PCA_DIM, random_state=RANDOM_STATE),
+        SVC(**SVM_PARAMS)                         # linear kernel
+        )
+
+
         print(f"  Running {CV_FOLDS}-fold CV...", end="", flush=True)
-        scores = cross_val_score(clf, X, y, cv=cv, scoring='accuracy', n_jobs=-1)
+        scores = cross_val_score(
+        clf, X, y, cv=cv,
+        scoring='balanced_accuracy', 
+        n_jobs=-1
+        )
         acc = scores.mean()
         print(f" done. Accuracy = {acc:.4f}\n")
 

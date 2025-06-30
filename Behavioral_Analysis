@@ -1,0 +1,108 @@
+# -*- coding: utf-8 -*-
+"""
+Analyse n_since_last_click distribution per subject,
+draw histograms, and compute KL divergence against a uniform distribution
+to suggest an optimal threshold (t > 0).  No ace_tools required.
+"""
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import entropy            # KL divergence
+
+# ---------- 0) I/O ----------
+file_path = "n_since_last_click_all_subjects.csv"
+df = pd.read_csv(file_path)
+
+expected_cols = {'subject', 'n_since_last_click'}
+if not expected_cols.issubset(df.columns):
+    raise ValueError(
+        f"CSV must contain columns {expected_cols}, but found {df.columns.tolist()}"
+    )
+
+# ---------- 1) Per-subject summary stats ----------
+summary_stats = (
+    df.groupby('subject')['n_since_last_click']
+      .describe()[['count', 'mean', 'std', 'min', '25%', '50%', '75%', 'max']]
+)
+
+print("\n=== Summary statistics per subject ===")
+print(summary_stats)
+summary_stats.to_csv("summary_stats.csv")        # saved for later use
+
+# ---------- 2) Helper: KL(P || U) ----------
+def kl_empirical_vs_uniform(values, start=None, end=None):
+    """
+    Compute KL divergence between an empirical PMF of `values`
+    and the discrete uniform PMF on [start, end] (inclusive).
+    """
+    values = np.asarray(values, dtype=int)
+    if start is None:
+        start = values.min()
+    if end is None:
+        end = values.max()
+
+    bins = np.arange(start, end + 2)             # right-open bins
+    counts, _ = np.histogram(values, bins=bins)
+    pmf = counts / counts.sum()                  # empirical P
+    unif_p = np.full_like(pmf, 1 / pmf.size, dtype=float)  # uniform Q
+    mask = pmf > 0                               # avoid log(0)
+    return entropy(pmf[mask], unif_p[mask])      # in nats
+
+# ---------- 3) Per-subject KL & histogram ----------
+subject_metrics = []
+min_count = 30                                   # minimum samples after thresholding
+
+for subject_id, sub_df in df.groupby('subject'):
+    vals = sub_df['n_since_last_click'].values
+
+    # 3.1 KL with full support (including zeros)
+    kl_all = kl_empirical_vs_uniform(vals)
+
+    # 3.2 KL after removing zeros
+    vals_no0 = vals[vals > 0]
+    kl_no0 = kl_empirical_vs_uniform(vals_no0, start=1)
+
+    # 3.3 Scan threshold t >= 1
+    max_n  = vals.max()
+    kl_vs_t, best_t, best_kl = {}, None, np.inf
+
+    for t in range(1, max_n + 1):
+        truncated = vals[vals >= t]
+        if truncated.size < min_count:
+            break
+        kl_t = kl_empirical_vs_uniform(truncated, start=t, end=max_n)
+        kl_vs_t[t] = kl_t
+        if kl_t < best_kl:
+            best_t, best_kl = t, kl_t
+
+    subject_metrics.append(
+        dict(subject=subject_id, KL_all=kl_all, KL_no0=kl_no0,
+             best_t=best_t, best_KL=best_kl)
+    )
+
+    # 3.4 Histogram
+    plt.figure()
+    sub_df['n_since_last_click'].hist(
+        bins=range(int(sub_df['n_since_last_click'].min()),
+                   int(sub_df['n_since_last_click'].max()) + 2)
+    )
+    plt.title(f"Subject {subject_id} – n_since_last_click Distribution")
+    plt.xlabel("n_since_last_click")
+    plt.ylabel("Frequency")
+    plt.tight_layout()
+    plt.show()
+
+    # 3.5 (Optional) KL-versus-t curve – uncomment if needed
+    # plt.figure()
+    # plt.plot(list(kl_vs_t.keys()), list(kl_vs_t.values()), marker='o')
+    # plt.title(f"Subject {subject_id} – KL divergence vs threshold t")
+    # plt.xlabel("threshold t")
+    # plt.ylabel("KL(P||U)")
+    # plt.tight_layout()
+    # plt.show()
+
+# ---------- 4) Display KL summary ----------
+kl_df = pd.DataFrame(subject_metrics)
+print("\n=== KL & threshold summary ===")
+print(kl_df)
+kl_df.to_csv("kl_threshold_summary.csv", index=False)
